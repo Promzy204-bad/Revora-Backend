@@ -124,21 +124,32 @@ describe('InvestmentService', () => {
       await expect(service.createInvestment(baseInput)).rejects.toThrow('Offering is not active');
     });
 
-    it('throws VALIDATION_ERROR when amount is invalid', async () => {
-      const offeringRow = makeOfferingRow({ status: 'active' });
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+    it.each(['-100', '0', 'abc', '100abc', '1e6', ' 5', '1.12345678901'])(
+      'rejects invalid amount format %j before database access',
+      async (amount) => {
+        await expect(
+          service.createInvestment({ ...baseInput, amount }),
+        ).rejects.toThrow('Invalid amount: must be a positive decimal string');
+        expect(mockPool.query).not.toHaveBeenCalled();
+      },
+    );
 
-      await expect(service.createInvestment({ ...baseInput, amount: '-100' })).rejects.toThrow(
-        'Invalid amount: must be a positive number',
-      );
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
-      await expect(service.createInvestment({ ...baseInput, amount: '0' })).rejects.toThrow(
-        'Invalid amount: must be a positive number',
-      );
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
-      await expect(service.createInvestment({ ...baseInput, amount: 'abc' })).rejects.toThrow(
-        'Invalid amount: must be a positive number',
-      );
+    it('accepts a positive decimal at the supported precision boundary', async () => {
+      const offeringRow = makeOfferingRow({ status: 'active' });
+      const investmentRow = makeInvestmentRow({ amount: '0.0000000001' });
+      mockPool.query
+        .mockResolvedValueOnce(mockQueryResult([offeringRow]))
+        .mockResolvedValueOnce({
+          rows: [investmentRow],
+          rowCount: 1,
+          command: 'INSERT',
+          oid: 0,
+          fields: [],
+        } as QueryResult<Investment>);
+
+      await expect(
+        service.createInvestment({ ...baseInput, amount: '0.0000000001' }),
+      ).resolves.toEqual(investmentRow);
     });
 
     it('throws VALIDATION_ERROR when asset is empty', async () => {

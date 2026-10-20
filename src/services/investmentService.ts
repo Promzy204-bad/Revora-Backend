@@ -8,6 +8,7 @@ import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -51,6 +52,11 @@ export class InvestmentService {
    * @throws Error if offering not found, invalid, or KYC-tier cap exceeded
    */
   async createInvestment(input: CreateInvestmentRequest): Promise<Investment> {
+    // Reject coercion-abuse inputs before database access or persistence.
+    if (!isPositiveDecimalAmount(input.amount)) {
+      throw Errors.validationError('Invalid amount: must be a positive decimal string');
+    }
+
     // 1. Validate offering exists
     const offering = await this.offeringRepo.findById(input.offering_id);
     if (!offering) {
@@ -65,9 +71,6 @@ export class InvestmentService {
 
     // 3. Validate amount
     const amountNum = parseFloat(input.amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      throw Errors.validationError('Invalid amount: must be a positive number');
-    }
 
     // 4. Validate asset
     if (!input.asset || input.asset.trim() === '') {
