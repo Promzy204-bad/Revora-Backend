@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { timingSafeEqual } from "crypto";
+import { Pool } from "pg";
 import express, {
   NextFunction,
   Request,
@@ -13,6 +14,7 @@ import { errorHandler } from "./middleware/errorHandler";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { Errors } from "./lib/errors";
 import { globalSampler } from "./lib/sampler";
+import { globalLogger } from "./lib/logger";
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -63,13 +65,17 @@ import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
+import {
+  createStellarTransactionVerifier,
+  StellarTransactionVerifier,
+} from "./lib/stellarTransactionVerifier";
 import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
 import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
 import { createAMLService } from "./aml/amlService";
-import { InMemorySecurityAuditRepository } from "./security/audit";
+import { InMemorySecurityAuditRepository, AuditLogSecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
@@ -84,7 +90,7 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
-
+import { StellarTransactionVerifierImpl } from './lib/stellarTransactionVerifier';
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
 
@@ -265,7 +271,7 @@ function isNonEmptyString(value: unknown, maxLength = 128): value is string {
 /**
  * @dev Decimal parser with strict input bounds to resist coercion abuse and NaN payloads.
  */
-function parseMoneyString(value: unknown): number | null {
+export function parseMoneyString(value: unknown): number | null {
   if (typeof value !== "string") return null;
   if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) return null;
   const parsed = Number(value);
@@ -743,7 +749,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
+  const amlAuditRepo = new AuditLogSecurityAuditRepository(auditLogRepo);
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,
@@ -825,6 +831,16 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createMetricsAuthMiddleware(),
     createReconciliationMetricsHandler(globalMetrics),
   );
+
+  // SCIM 2.0 provisioning (#1300), only when a token is configured.
+  // IdPs send application/scim+json, which the global parser skips.
+  if (env.SCIM_TOKEN) {
+    app.use(
+      "/scim/v2",
+      express.json({ type: ["application/json", "application/scim+json"], limit: "32kb" }),
+      createScimRouter(new UserRepository(pool), env.SCIM_TOKEN),
+    );
+  }
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -1179,6 +1195,36 @@ export class WebhookQueue {
   }
 }
 
+/**
+ * Build a PayoutDriftDetector, injecting a StellarTransactionVerifier when
+ * STELLAR_HORIZON_URL is configured. Logs a startup warning and sets the
+ * payout_drift_verifier_enabled gauge to 0 when it is not configured.
+ */
+export function createPayoutDriftDetector(
+  pool: Pool,
+  driftRepo: PayoutDriftRepository,
+  metrics: MetricsCollector,
+): PayoutDriftDetector {
+  const configured = Boolean(process.env.STELLAR_HORIZON_URL);
+  const txVerifier: StellarTransactionVerifier | undefined = configured
+    ? createStellarTransactionVerifier()
+    : undefined;
+
+  if (!configured) {
+    globalLogger.warn('PayoutDriftDetector: no STELLAR_HORIZON_URL configured; under/overfunded drift will not be detected');
+    globalMetrics.setGauge(
+      'payout_drift_verifier_enabled',
+      0,
+      {},
+      '1 when a StellarTransactionVerifier is configured for payout drift detection'
+    );
+  } else {
+    globalMetrics.setGauge('payout_drift_verifier_enabled', 1, {});
+  }
+
+  return new PayoutDriftDetector(pool, driftRepo, metrics, txVerifier);
+}
+
 /* istanbul ignore next -- bootstrapping is integration-environment specific */
 if (require.main === module && env.NODE_ENV !== "test") {
   process.on("SIGTERM", () => {
@@ -1198,14 +1244,12 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   const metricsCollector = new MetricsCollector();
 
-  const payoutDriftRepo = new PayoutDriftRepository(pool);
-  const payoutDriftDetector = new PayoutDriftDetector(
+  const unconditionalPayoutDriftDetector = createPayoutDriftDetector(
     pool,
-    payoutDriftRepo,
+    new PayoutDriftRepository(pool),
     metricsCollector
   );
-  
-  payoutDriftDetector.start(); // Start nightly payout drift detection
+  unconditionalPayoutDriftDetector.start(); // Start nightly payout drift detection
   globalSampler.start(); // Start event loop lag monitoring
 
   if (roleConfig.auditPurge) {
@@ -1226,10 +1270,10 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   if (roleConfig.payoutDrift) {
     const payoutDriftRepo = new PayoutDriftRepository(pool);
-    const payoutDriftDetector = new PayoutDriftDetector(
+    const payoutDriftDetector = createPayoutDriftDetector(
       pool,
       payoutDriftRepo,
-      metricsCollector,
+      metricsCollector
     );
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
@@ -1237,10 +1281,19 @@ if (require.main === module && env.NODE_ENV !== "test") {
   }
 
   if (roleConfig.reconciliation) {
+    // Build a StellarTransactionVerifier from the configured Horizon URL so that
+    // chain consistency checks can validate distribution transactions on-chain.
+    // When STELLAR_HORIZON_URL is absent the verifier falls back to the testnet
+    // endpoint; chain validation is still skipped with a single warning discrepancy
+    // if the verifier cannot be constructed.
+    const txVerifier = new StellarTransactionVerifierImpl({
+      horizonUrl: env.STELLAR_HORIZON_URL,
+    });
     const reconciliationScheduler = createReconciliationSchedulerRuntime({
       db: pool,
       metrics: globalMetrics,
       logger: undefined,
+      txVerifier,
     });
     reconciliationScheduler.start();
     backgroundStopFns.push(() => reconciliationScheduler.stop());

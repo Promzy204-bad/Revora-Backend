@@ -9,6 +9,8 @@ export const ErrorCode = {
   SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
   INTERNAL_ERROR: "INTERNAL_ERROR",
   TOO_MANY_REQUESTS: "TOO_MANY_REQUESTS",
+  INVALID_JSON: "INVALID_JSON",
+  PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -166,7 +168,11 @@ export class UniqueConstraintError extends Error {
   public readonly field: string;
 
   constructor(field: string) {
-    super(`Duplicate value for field: ${field}`);
+    // Canonical message form per Requirements 3.1–3.3 (see
+    // src/lib/__tests__/errors.property.test.ts Property 5):
+    // `Unique constraint violation on <field>`. Consumers (register roundtrip
+    // Req 3.3, startup-auth 409 mapping) assert this exact string.
+    super(`Unique constraint violation on ${field}`);
     Object.setPrototypeOf(this, new.target.prototype);
     this.name = 'UniqueConstraintError';
     this.field = field;
